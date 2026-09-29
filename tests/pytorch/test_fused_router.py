@@ -35,9 +35,14 @@ def _get_tolerances(dtype: torch.dtype, num_experts: int):
     """
     # Default tolerances for torch.testing.assert_close
     base_atol, base_rtol = 1e-5, 1.3e-6
-    # TODO: account for fp16, bf16 as dtype
-    if dtype != torch.float32:
-        raise NotImplementedError("tolerances implemented for fp32 only")
+    # The kernels compute in fp32 and round once on store, so low-precision outputs
+    # differ from the fp32-computed reference by at most one rounding step.
+    if dtype == torch.bfloat16:
+        base_rtol = 1.6e-2
+    elif dtype == torch.float16:
+        base_rtol = 1e-3
+    elif dtype != torch.float32:
+        raise NotImplementedError(f"tolerances not implemented for {dtype}")
     eps = 2e-7
     # The worst-case rounding error from summing N values is O(N * eps).
     # Use 2 * num_experts * eps as the tolerance floor so tests pass for
@@ -86,10 +91,14 @@ def topk_score_function_pytorch(
     scaling_factor: Optional[float] = None,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
+    precomputed_indices: Optional[torch.Tensor] = None,
 ):
     num_tokens, num_experts = logits.shape
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        if precomputed_indices is not None:
+            top_indices = precomputed_indices.long()
+            return torch.gather(scores, dim=1, index=top_indices), top_indices
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -114,7 +123,7 @@ def topk_score_function_pytorch(
             scores = torch.sigmoid(logits.float())
         else:
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
+        if expert_bias is not None and precomputed_indices is None:
             scores_for_routing = scores + expert_bias
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices)
@@ -1011,6 +1020,217 @@ def test_topk_preserves_leading_dims(topk_index_dtype):
     assert probs.shape == logits.shape
     expected_routing_shape = topk_indices.shape if topk_indices is not None else logits.shape
     assert routing_output.shape == expected_routing_shape
+
+
+def _random_distinct_indices(num_tokens, num_experts, topk, dtype):
+    """Distinct per-row expert indices, generally unrelated to the logits' own top-k."""
+    return (
+        torch.rand(num_tokens, num_experts, device="cuda")
+        .argsort(dim=-1)[:, :topk]
+        .to(dtype)
+        .contiguous()
+    )
+
+
+def run_precomputed_indices_comparison(
+    dtype,
+    num_tokens,
+    num_experts,
+    topk,
+    use_pre_softmax,
+    scaling_factor,
+    score_function,
+    index_dtype=torch.int32,
+    routing_map_format=RoutingMapFormat.BYTEMAP,
+):
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32) * 2
+    logits = logits.to(dtype).requires_grad_(True)
+    logits_fused = logits.detach().clone().requires_grad_(True)
+    indices = _random_distinct_indices(num_tokens, num_experts, topk, index_dtype)
+    # Selection-only arguments must be ignored when the selection is given.
+    if score_function in ("sigmoid", "sqrtsoftplus"):
+        expert_bias = torch.randn(num_experts, device="cuda", dtype=torch.float32)
+    else:
+        expert_bias = None
+    num_groups, group_topk = (8, 4) if num_experts % 8 == 0 and topk % 4 == 0 else (None, None)
+
+    probs, routing_map = topk_score_function_pytorch(
+        logits=logits,
+        topk=topk,
+        use_pre_softmax=use_pre_softmax,
+        scaling_factor=scaling_factor,
+        score_function=score_function,
+        precomputed_indices=indices,
+    )
+    probs_fused, routing_map_fused = fused_topk_with_score_function(
+        logits=logits_fused,
+        topk=topk,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        scaling_factor=scaling_factor,
+        score_function=score_function,
+        expert_bias=expert_bias,
+        routing_map_format=routing_map_format,
+        precomputed_indices=indices,
+    )
+
+    assert probs_fused.dtype == dtype
+    atol, rtol = _get_tolerances(dtype, num_experts)
+    torch.testing.assert_close(probs_fused, probs, atol=atol, rtol=rtol)
+    if routing_map_format == RoutingMapFormat.BITMAP_U8:
+        routing_map = _bytemap_to_bitmap_u8(routing_map)
+    torch.testing.assert_close(routing_map_fused, routing_map, atol=0, rtol=0)
+
+    # A non-uniform upstream gradient: d(sum(probs)) vanishes for normalized scores.
+    grad_probs = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32).to(dtype)
+    probs.backward(grad_probs)
+    probs_fused.backward(grad_probs)
+    torch.testing.assert_close(logits_fused.grad, logits.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [2048, 7171])
+@pytest.mark.parametrize("num_experts", [32, 128, 384, 896])
+@pytest.mark.parametrize("topk", [1, 4, 8, 16, 32])
+@pytest.mark.parametrize(
+    "score_function,use_pre_softmax",
+    [("sigmoid", False), ("sqrtsoftplus", False), ("softmax", False), ("softmax", True)],
+)
+@pytest.mark.parametrize("scaling_factor", [None, 2.5])
+def test_topk_precomputed_indices(
+    dtype, num_tokens, num_experts, topk, score_function, use_pre_softmax, scaling_factor
+):
+    if topk >= num_experts:
+        pytest.skip(f"topk ({topk}) >= num_experts ({num_experts})")
+    run_precomputed_indices_comparison(
+        dtype=dtype,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        topk=topk,
+        use_pre_softmax=use_pre_softmax,
+        scaling_factor=scaling_factor,
+        score_function=score_function,
+    )
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int16, torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "routing_map_format", [RoutingMapFormat.BYTEMAP, RoutingMapFormat.BITMAP_U8]
+)
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_topk_precomputed_indices_formats(index_dtype, routing_map_format, score_function):
+    run_precomputed_indices_comparison(
+        dtype=torch.float32,
+        num_tokens=1024,
+        num_experts=130,
+        topk=8,
+        use_pre_softmax=False,
+        scaling_factor=1.2,
+        score_function=score_function,
+        index_dtype=index_dtype,
+        routing_map_format=routing_map_format,
+    )
+
+
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("use_pre_softmax", [False, True])
+@pytest.mark.parametrize("topk", [4, 32])
+def test_topk_precomputed_indices_matches_own_selection(score_function, use_pre_softmax, topk):
+    """Feeding the kernel's own selection back reproduces its outputs bit for bit."""
+    if score_function != "softmax" and use_pre_softmax:
+        pytest.skip("pre-softmax applies to softmax only")
+    num_tokens, num_experts = 4096, 256
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    logits_selected = logits.clone().requires_grad_(True)
+    logits_replayed = logits.clone().requires_grad_(True)
+    kwargs = dict(
+        topk=topk,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=2.5,
+        score_function=score_function,
+        expert_bias=None,
+    )
+    # The dense-index output gives the selection in the kernel's slot order, which fixes the
+    # order of the normalization sum.
+    selected = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+    fused_topk_with_score_function(logits=logits.clone(), topk_indices=selected, **kwargs)
+    probs, routing_map = fused_topk_with_score_function(logits=logits_selected, **kwargs)
+    probs_replayed, routing_map_replayed = fused_topk_with_score_function(
+        logits=logits_replayed, precomputed_indices=selected, **kwargs
+    )
+    torch.testing.assert_close(routing_map_replayed, routing_map, atol=0, rtol=0)
+    torch.testing.assert_close(probs_replayed, probs, atol=0, rtol=0)
+
+    grad_probs = torch.randn_like(probs)
+    probs.backward(grad_probs)
+    probs_replayed.backward(grad_probs)
+    torch.testing.assert_close(logits_replayed.grad, logits_selected.grad, atol=0, rtol=0)
+
+
+def test_topk_precomputed_indices_preserves_leading_dims():
+    num_tokens, num_experts, topk = 128, 32, 4
+    logits = torch.randn(num_tokens, 2, num_experts, device="cuda", dtype=torch.float32)
+    indices = _random_distinct_indices(num_tokens * 2, num_experts, topk, torch.int64)
+    probs, routing_map = fused_topk_with_score_function(
+        logits=logits,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function="softmax",
+        expert_bias=None,
+        precomputed_indices=indices.view(num_tokens, 2, topk),
+    )
+    assert probs.shape == logits.shape
+    assert routing_map.shape == logits.shape
+    probs_2d, routing_map_2d = topk_score_function_pytorch(
+        logits.view(-1, num_experts), topk, precomputed_indices=indices
+    )
+    torch.testing.assert_close(probs.view(-1, num_experts), probs_2d)
+    torch.testing.assert_close(routing_map.view(-1, num_experts), routing_map_2d)
+
+
+def test_topk_precomputed_indices_argument_validation():
+    num_tokens, num_experts, topk = 64, 32, 4
+    logits = torch.randn(num_tokens, num_experts, device="cuda")
+    indices = _random_distinct_indices(num_tokens, num_experts, topk, torch.int32)
+    kwargs = dict(
+        logits=logits,
+        topk=topk,
+        use_pre_softmax=False,
+        num_groups=None,
+        group_topk=None,
+        scaling_factor=None,
+        score_function="sigmoid",
+    )
+    with pytest.raises(ValueError, match="topk_indices"):
+        fused_topk_with_score_function(
+            expert_bias=None,
+            precomputed_indices=indices,
+            topk_indices=torch.empty_like(indices),
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="Quantile Balancing"):
+        fused_topk_with_score_function(
+            expert_bias=torch.zeros(num_experts, device="cuda"),
+            precomputed_indices=indices,
+            qb_histogram=torch.zeros(num_experts, 16, device="cuda", dtype=torch.int32),
+            qb_bin_bounds=torch.tensor([-1.0, 1.0], device="cuda"),
+            qb_histogram_mode="two_kernel",
+            **kwargs,
+        )
+    with pytest.raises(RuntimeError, match="precomputed_indices shape"):
+        fused_topk_with_score_function(
+            expert_bias=None, precomputed_indices=indices[:, : topk - 1].contiguous(), **kwargs
+        )
+    with pytest.raises(RuntimeError, match="precomputed_indices dtype"):
+        fused_topk_with_score_function(
+            expert_bias=None, precomputed_indices=indices.float(), **kwargs
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32])

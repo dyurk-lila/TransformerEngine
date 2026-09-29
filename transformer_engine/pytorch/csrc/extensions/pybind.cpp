@@ -145,7 +145,8 @@ void init_router_bindings(pybind11::module &m) {
         py::arg("group_topk"), py::arg("scaling_factor"), py::arg("score_function"),
         py::arg("expert_bias"),
         py::arg("routing_map_format") = static_cast<int>(NVTE_ROUTING_MAP_FORMAT_BYTEMAP),
-        py::arg("topk_indices") = std::nullopt, "Fused topk with score function fwd");
+        py::arg("topk_indices") = std::nullopt, py::arg("precomputed_indices") = std::nullopt,
+        "Fused topk with score function fwd");
   m.def("fused_topk_with_score_function_qb_fwd", &fused_topk_with_score_function_qb_fwd,
         py::arg("logits"), py::arg("topk"), py::arg("scaling_factor"), py::arg("expert_bias"),
         py::arg("routing_map_format"), py::arg("topk_indices"), py::arg("histogram"),

@@ -36,7 +36,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
     std::optional<int> group_topk, std::optional<float> scaling_factor, std::string score_function,
     std::optional<at::Tensor> expert_bias,
     int routing_map_format = static_cast<int>(NVTE_ROUTING_MAP_FORMAT_BYTEMAP),
-    std::optional<at::Tensor> topk_indices = std::nullopt);
+    std::optional<at::Tensor> topk_indices = std::nullopt,
+    std::optional<at::Tensor> precomputed_indices = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 fused_topk_with_score_function_qb_fwd(at::Tensor logits, int topk,

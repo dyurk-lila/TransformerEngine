@@ -105,6 +105,37 @@ void nvte_fused_topk_with_score_function_forward_with_indices(
     const NVTETensor expert_bias, NVTETensor probs, NVTETensor topk_indices,
     NVTETensor intermediate_output, cudaStream_t stream);
 
+/*! \brief Apply softmax/sigmoid/sqrtsoftplus at caller-selected experts, skipping Top-k selection.
+ *
+ *  Produces the same probs, routing_map, and intermediate_output as
+ *  nvte_fused_topk_with_score_function_forward_v2 would if its Top-k had selected
+ *  precomputed_indices, so nvte_fused_topk_with_score_function_backward_v2 computes the
+ *  gradient. Expert bias and grouped Top-k only affect selection and therefore do not apply.
+ *  Used for routing replay and for routers whose selection is computed separately.
+ *
+ *  \param[in]     logits          Logits from the gating GEMM.
+ *  \param[in]     num_tokens      Number of tokens.
+ *  \param[in]     num_experts     Number of experts.
+ *  \param[in]     topk            Topk value.
+ *  \param[in]     use_pre_softmax Whether to use softmax before topk.
+ *  \param[in]     scaling_factor  Scaling factor.
+ *  \param[in]     score_function  Score function, 0: sigmoid, 1: softmax, 2: sqrtsoftplus.
+ *  \param[in]     precomputed_indices  Selected experts, shape [num_tokens, topk], int16/int32/int64.
+ *                                      Each row must hold distinct indices in [0, num_experts).
+ *  \param[out]    probs           Output tensor for probabilities.
+ *  \param[out]    routing_map     Output tensor for routing map. Shape depends on
+ *                                 routing_map_format (see NVTERoutingMapFormat).
+ *  \param[in]     routing_map_format NVTERoutingMapFormat value selecting the routing_map
+ *                                    output layout.
+ *  \param[out]    intermediate_output  Output tensor for intermediate output. (Softmax/sigmoid output)
+ *  \param[in]     stream          CUDA stream used for the operation.
+ */
+void nvte_fused_topk_with_score_function_forward_precomputed_indices(
+    const NVTETensor logits, int num_tokens, int num_experts, int topk, int use_pre_softmax,
+    float scaling_factor, int score_function, const NVTETensor precomputed_indices,
+    NVTETensor probs, NVTETensor routing_map, NVTERoutingMapFormat routing_map_format,
+    NVTETensor intermediate_output, cudaStream_t stream);
+
 /*! \brief Kimi K3 Quantile Balancing fused-router forward.
  *
  *  The router selects Top-(k+1) from biased sigmoid scores, writes only the first

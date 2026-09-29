@@ -47,18 +47,18 @@ static bool is_supported_dense_index_dtype(at::ScalarType dtype) {
 }
 
 static void check_dense_topk_indices(const at::Tensor &topk_indices, const at::Tensor &ref,
-                                     c10::IntArrayRef leading_dims, int topk) {
-  TORCH_CHECK(topk_indices.is_cuda(), "topk_indices must be a CUDA tensor");
-  TORCH_CHECK(topk_indices.device() == ref.device(), "topk_indices must be on the same device as ",
+                                     c10::IntArrayRef leading_dims, int topk,
+                                     const char *name = "topk_indices") {
+  TORCH_CHECK(topk_indices.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(topk_indices.device() == ref.device(), name, " must be on the same device as ",
               "the logits/grad tensor");
-  TORCH_CHECK(topk_indices.is_contiguous(), "topk_indices must be contiguous");
-  TORCH_CHECK(is_supported_dense_index_dtype(topk_indices.scalar_type()),
-              "topk_indices dtype must be int16, int32, or int64, got ",
-              topk_indices.scalar_type());
+  TORCH_CHECK(topk_indices.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(is_supported_dense_index_dtype(topk_indices.scalar_type()), name,
+              " dtype must be int16, int32, or int64, got ", topk_indices.scalar_type());
   std::vector<int64_t> expected_shape(leading_dims.begin(), leading_dims.end());
   expected_shape.push_back(static_cast<int64_t>(topk));
-  TORCH_CHECK(topk_indices.sizes() == expected_shape,
-              "topk_indices shape must be [*leading_dims, topk]=", expected_shape, ", got ",
+  TORCH_CHECK(topk_indices.sizes() == expected_shape, name,
+              " shape must be [*leading_dims, topk]=", expected_shape, ", got ",
               topk_indices.sizes());
 }
 
@@ -66,7 +66,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
     at::Tensor logits, int topk, bool use_pre_softmax, std::optional<int> num_groups,
     std::optional<int> group_topk, std::optional<float> scaling_factor, std::string score_function,
     std::optional<at::Tensor> expert_bias, int routing_map_format,
-    std::optional<at::Tensor> topk_indices) {
+    std::optional<at::Tensor> topk_indices, std::optional<at::Tensor> precomputed_indices) {
   check_routing_map_format(routing_map_format);
   TORCH_CHECK(logits.dim() >= 1, "logits must have at least 1 dim");
   TORCH_CHECK(logits.is_contiguous(), "logits must be contiguous");
@@ -97,6 +97,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
                 "topk_indices output cannot be combined with non-default routing_map_format; "
                 "dense top-k indices are returned instead of a routing map.");
     check_dense_topk_indices(topk_indices.value(), logits, sizes.slice(0, sizes.size() - 1), topk);
+  }
+  if (precomputed_indices.has_value()) {
+    TORCH_CHECK(!topk_indices.has_value(),
+                "precomputed_indices cannot be combined with the topk_indices output");
+    check_dense_topk_indices(precomputed_indices.value(), logits, sizes.slice(0, sizes.size() - 1),
+                             topk, "precomputed_indices");
   }
 
   // Reformat the input to make it compatible with the kernel
@@ -136,7 +142,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
     expert_bias_cu = makeTransformerEngineTensor(expert_bias.value());
   }
 
-  if (topk_indices.has_value()) {
+  if (precomputed_indices.has_value()) {
+    const std::vector<size_t> indices_shape_2d = {static_cast<size_t>(num_tokens),
+                                                  static_cast<size_t>(topk)};
+    auto precomputed_indices_cu = makeTransformerEngineTensor(
+        precomputed_indices.value().data_ptr(), indices_shape_2d,
+        GetTransformerEngineDType(precomputed_indices.value().scalar_type()));
+    nvte_fused_topk_with_score_function_forward_precomputed_indices(
+        logits_cu.data(), static_cast<int>(num_tokens), static_cast<int>(num_experts), topk,
+        use_pre_softmax, scaling_factor_value, get_score_function_value(score_function),
+        precomputed_indices_cu.data(), probs_cu.data(), routing_map_cu.data(),
+        static_cast<NVTERoutingMapFormat>(routing_map_format), intermediate_output_cu.data(),
+        at::cuda::getCurrentCUDAStream());
+  } else if (topk_indices.has_value()) {
     nvte_fused_topk_with_score_function_forward_with_indices(
         logits_cu.data(), static_cast<int>(num_tokens), static_cast<int>(num_experts), topk,
         use_pre_softmax, num_groups_value, group_topk_value, scaling_factor_value,

@@ -156,6 +156,7 @@ class FusedTopkScoreFunction(torch.autograd.Function):
         expert_bias: Optional[torch.Tensor],
         routing_map_format: int,
         topk_indices: Optional[torch.Tensor],
+        precomputed_indices: Optional[torch.Tensor],
     ):
         # pylint: disable=missing-function-docstring
         probs, routing_output, intermediate_output = tex.fused_topk_with_score_function_fwd(
@@ -169,6 +170,7 @@ class FusedTopkScoreFunction(torch.autograd.Function):
             expert_bias,
             routing_map_format,
             topk_indices,
+            precomputed_indices,
         )
         if topk_indices is not None:
             routing_output = topk_indices
@@ -203,7 +205,7 @@ class FusedTopkScoreFunction(torch.autograd.Function):
             ctx.use_dense_indices,
             ctx.routing_map_format,
         )
-        return grad_logits, None, None, None, None, None, None, None, None, None
+        return grad_logits, None, None, None, None, None, None, None, None, None, None
 
 
 class FusedTopkScoreFunctionQB(torch.autograd.Function):
@@ -290,6 +292,7 @@ def fused_topk_with_score_function(
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
     qb_histogram_mode: Optional[str] = None,
+    precomputed_indices: Optional[torch.Tensor] = None,
 ):
     """
     Fused topk with score function router.
@@ -330,6 +333,14 @@ def fused_topk_with_score_function(
         Invalid replay-time bounds may silently produce an incorrect histogram.
     qb_histogram_mode : str, optional
         ``"two_kernel"`` or ``"fused_atomic"``. Must be provided with the two QB tensors.
+    precomputed_indices : torch.Tensor, optional
+        int16/int32/int64 CUDA tensor with shape [*logits.shape[:-1], topk] holding the
+        experts selected by the caller, e.g. for routing replay. When provided, top-k
+        selection is skipped and the probs are computed for these experts with the given
+        score function, pre/post-softmax order, normalization, and scaling factor.
+        ``expert_bias``, ``num_groups``, and ``group_topk`` only affect selection and are
+        ignored. Each row must contain distinct indices in [0, num_experts). Cannot be
+        combined with ``topk_indices`` or Quantile Balancing.
 
     Returns
     -------
@@ -346,6 +357,12 @@ def fused_topk_with_score_function(
         raise ValueError("Current TE does not support float64 router type.")
     routing_map_format = _validate_routing_map_format(routing_map_format)
     qb_arguments = (qb_histogram, qb_bin_bounds, qb_histogram_mode)
+    if precomputed_indices is not None:
+        if topk_indices is not None:
+            raise ValueError("precomputed_indices cannot be combined with topk_indices")
+        if any(value is not None for value in qb_arguments):
+            raise ValueError("precomputed_indices cannot be combined with Quantile Balancing")
+        expert_bias, num_groups, group_topk = None, None, None
     if any(value is not None for value in qb_arguments):
         if any(value is None for value in qb_arguments):
             raise ValueError(
@@ -386,6 +403,7 @@ def fused_topk_with_score_function(
         expert_bias,
         routing_map_format,
         topk_indices,
+        precomputed_indices,
     )
 
 
